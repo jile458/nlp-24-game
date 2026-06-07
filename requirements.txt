@@ -1,0 +1,21 @@
+# 核心深度学习框架
+torch>=2.1.0
+
+# Hugging Face 大模型生态
+transformers>=4.48.0
+datasets>=2.16.0
+accelerate>=0.26.0
+
+# 强化学习与高效微调核心库
+trl>=0.14.0
+peft>=0.7.0
+
+# 极限低显存量化优化器 (6GB 显存必备)
+bitsandbytes>=0.41.0
+
+# 数据分析与可视化 (用于绘制 Reward 正确率曲线)
+pandas>=2.0.0
+matplotlib>=3.7.0
+
+# 进度条展示 (用于评估脚本)
+tqdm>=4.66.0

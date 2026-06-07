@@ -1,0 +1,18 @@
+# Python 虚拟环境和缓存
+venv/
+__pycache__/
+.env
+
+# 模型输出权重 (绝对不能传，太大了！)
+outputs/
+*.safetensors
+*.bin
+
+# 训练数据集和庞大的日志 (非必要不上传)
+data/*.jsonl
+train_log.txt
+training_metrics.csv
+*.png
+
+# VS Code 配置
+.vscode/
