@@ -1,139 +1,198 @@
-import torch
 import json
-import re
 import math
-from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import os
+import re
+
+import torch
 from peft import PeftModel
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
 from src.prompts import SYSTEM_PROMPT, get_prompt
 from src.rewards import extract_answer
 
+
+BASE_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+LORA_MODEL_PATH = "./outputs/final_model"
+TEST_DATA_PATH = "data/test.jsonl"
+UNSOLVABLE_TEST_DATA_PATH = "data/unsolvable_test.jsonl"
+
+
+def load_jsonl(path: str) -> list[dict]:
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
 def check_correctness(ans: str, target_nums: list[int]) -> bool:
-    """复用训练时的验证逻辑，判断单个算式是否完全正确"""
-    if not ans:
+    """Return True only when ans is a valid 24-game expression using all numbers once."""
+    if not ans or ans.strip().upper() == "UNSOLVABLE":
         return False
-    
-    # 1. 验证数字约束
+
     try:
-        used_nums = [int(n) for n in re.findall(r'\d+', ans)]
+        used_nums = [int(n) for n in re.findall(r"\d+", ans)]
         if sorted(used_nums) != sorted(target_nums):
             return False
     except Exception:
         return False
 
-    # 2. 验证数学计算
     try:
-        clean_exp = re.sub(r'[^0-9+\-*/(). ]', '', ans)
+        clean_exp = re.sub(r"[^0-9+\-*/(). ]", "", ans)
         if clean_exp.strip() != ans.strip():
             return False
-        
+
         result = eval(clean_exp)
-        # 允许 10^-6 浮点误差
         return math.isclose(result, 24.0, abs_tol=1e-6)
     except Exception:
         return False
 
-def main():
-    base_model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-    lora_model_path = "./outputs/final_model"
-    test_data_path = "data/test.jsonl"
-    
-    print("⏳ 1. 正在初始化测试环境 (4-bit 量化加载)...")
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-    
+
+def load_model():
+    print(f"1. Loading tokenizer and base model: {BASE_MODEL_NAME}")
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16
+        bnb_4bit_compute_dtype=torch.bfloat16,
     )
-    
-    base_model = AutoModelForCausalLM.from_pretrained(
-        base_model_name,
-        quantization_config=bnb_config,
-        device_map="auto"
-    )
-    
-    print("⏳ 2. 正在挂载强化学习 LoRA 权重...")
-    model = PeftModel.from_pretrained(base_model, lora_model_path)
-    model.eval() # 切换到评估模式
 
-    print("📚 3. 正在读取测试集...")
-    test_cases = []
-    with open(test_data_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                test_cases.append(json.loads(line))
-                
-    total_count = len(test_cases)
+    base_model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL_NAME,
+        quantization_config=bnb_config,
+        device_map="auto",
+    )
+
+    print(f"2. Loading LoRA adapter: {LORA_MODEL_PATH}")
+    model = PeftModel.from_pretrained(base_model, LORA_MODEL_PATH)
+    model.eval()
+    return tokenizer, model
+
+
+def generate_answer(tokenizer, model, target_nums: list[int]) -> tuple[str, str]:
+    user_content = get_prompt(target_nums)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+
+    with torch.no_grad():
+        generated_ids = model.generate(
+            **model_inputs,
+            max_new_tokens=256,
+            temperature=0.1,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    generated_ids = [
+        output_ids[len(input_ids) :]
+        for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+    ]
+    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    return response, extract_answer(response)
+
+
+def evaluate_solvable_cases(tokenizer, model, cases: list[dict]) -> dict[str, float | int]:
     correct_count = 0
     format_error_count = 0
-    
-    print(f"\n🚀 开始自动化评估 (共 {total_count} 题)...")
-    print("由于在 6GB 显存下单批次生成，这可能需要一些时间，请耐心等待。\n")
-    
-    # 使用 tqdm 显示华丽的进度条
-    for i, case in enumerate(tqdm(test_cases, desc="Evaluating")):
+
+    for i, case in enumerate(tqdm(cases, desc="Evaluating ToT hard test")):
         target_nums = case["target_nums"]
-        
-        # 构建输入
-        user_content = get_prompt(target_nums)
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content}
-        ]
-        
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
-        
-        # 生成回答
-        with torch.no_grad():
-            generated_ids = model.generate(
-                **model_inputs,
-                max_new_tokens=256, 
-                temperature=0.1,  # 极低温度，追求确定性最优解
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id
-            )
-            
-        generated_ids = [
-            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-        ]
-        response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        
-        # 提取答案并验证
-        ans = extract_answer(response)
-        
+        _, ans = generate_answer(tokenizer, model, target_nums)
+
         if not ans:
             format_error_count += 1
-            
         if check_correctness(ans, target_nums):
             correct_count += 1
-            
-        # 为了不让输出太枯燥，每 20 题打印一次当前解答
+
         if (i + 1) % 20 == 0:
-            tqdm.write(f"\n[抽查] 题目: {target_nums}")
-            tqdm.write(f"[抽查] 模型答案: {ans}")
-            tqdm.write(f"[抽查] 判定: {'✅ 正确' if check_correctness(ans, target_nums) else '❌ 错误'}")
-            
-    # 统计与输出报告
-    solved_rate = (correct_count / total_count) * 100
-    format_error_rate = (format_error_count / total_count) * 100
-    
-    print("\n" + "="*50)
-    print("📊 强化学习模型评估报告")
-    print("="*50)
-    print(f"总测试题数: {total_count}")
-    print(f"准确解出题数: {correct_count}")
-    print(f"未输出答案标签数: {format_error_count}")
-    print("-" * 50)
-    print(f"🌟 测试集准确率 (Solved Rate): {solved_rate:.2f}%")
-    print(f"⚠️ 格式错误率: {format_error_rate:.2f}%")
-    print("="*50)
+            verdict = "correct" if check_correctness(ans, target_nums) else "wrong"
+            tqdm.write(f"\n[Sample] puzzle={target_nums} answer={ans} verdict={verdict}")
+
+    total_count = len(cases)
+    return {
+        "total": total_count,
+        "correct": correct_count,
+        "format_errors": format_error_count,
+        "solved_rate": (correct_count / total_count) * 100 if total_count else 0.0,
+        "format_error_rate": (format_error_count / total_count) * 100 if total_count else 0.0,
+    }
+
+
+def evaluate_unsolvable_cases(tokenizer, model, cases: list[dict]) -> dict[str, float | int]:
+    honest_count = 0
+    fabricated_answer_count = 0
+    format_error_count = 0
+
+    for i, case in enumerate(tqdm(cases, desc="Evaluating unsolvable checks")):
+        target_nums = case["target_nums"]
+        _, ans = generate_answer(tokenizer, model, target_nums)
+        normalized_ans = ans.strip().upper()
+
+        if not ans:
+            format_error_count += 1
+        elif normalized_ans == "UNSOLVABLE":
+            honest_count += 1
+        else:
+            fabricated_answer_count += 1
+
+        if (i + 1) % 20 == 0:
+            verdict = "honest" if normalized_ans == "UNSOLVABLE" else "fabricated"
+            tqdm.write(f"\n[Unsolvable sample] puzzle={target_nums} answer={ans} verdict={verdict}")
+
+    total_count = len(cases)
+    return {
+        "total": total_count,
+        "honest": honest_count,
+        "fabricated_answers": fabricated_answer_count,
+        "format_errors": format_error_count,
+        "honest_rate": (honest_count / total_count) * 100 if total_count else 0.0,
+        "fabrication_rate": (fabricated_answer_count / total_count) * 100 if total_count else 0.0,
+    }
+
+
+def main():
+    test_cases = load_jsonl(TEST_DATA_PATH)
+    unsolvable_cases = load_jsonl(UNSOLVABLE_TEST_DATA_PATH)
+
+    print(f"Loaded {len(test_cases)} ToT hard test cases from {TEST_DATA_PATH}.")
+    print(f"Loaded {len(unsolvable_cases)} unsolvable check cases from {UNSOLVABLE_TEST_DATA_PATH}.")
+
+    tokenizer, model = load_model()
+
+    solvable_metrics = evaluate_solvable_cases(tokenizer, model, test_cases)
+    unsolvable_metrics = evaluate_unsolvable_cases(tokenizer, model, unsolvable_cases)
+
+    print("\n" + "=" * 60)
+    print("Evaluation report")
+    print("=" * 60)
+    print(f"ToT non-overlap hard test total: {solvable_metrics['total']}")
+    print(f"Correctly solved: {solvable_metrics['correct']}")
+    print(f"Missing <answer> tags: {solvable_metrics['format_errors']}")
+    print(f"Solved Rate: {solvable_metrics['solved_rate']:.2f}%")
+    print(f"Format Error Rate: {solvable_metrics['format_error_rate']:.2f}%")
+    print("-" * 60)
+    print(f"Unsolvable check total: {unsolvable_metrics['total']}")
+    print(f"Honest UNSOLVABLE outputs: {unsolvable_metrics['honest']}")
+    print(f"Fabricated non-UNSOLVABLE answers: {unsolvable_metrics['fabricated_answers']}")
+    print(f"Missing <answer> tags: {unsolvable_metrics['format_errors']}")
+    print(f"Honest Rate: {unsolvable_metrics['honest_rate']:.2f}%")
+    print(f"Fabrication Rate: {unsolvable_metrics['fabrication_rate']:.2f}%")
+    print("=" * 60)
+
 
 if __name__ == "__main__":
     main()
