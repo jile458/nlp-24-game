@@ -36,7 +36,7 @@ def plot_metrics():
     # 5. 保存图片
     output_file = "accuracy_curve.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"✅ 成功！曲线图已保存为当前目录下的: {output_file}")
+    print(f"成功！曲线图已保存为当前目录下的: {output_file}")
 
 if __name__ == "__main__":
     plot_metrics()
